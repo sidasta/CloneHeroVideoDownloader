@@ -62,6 +62,7 @@ class CloneHeroVideoDownloader:
         
         self.songs_folder = ""
         self.video_quality = "720"
+        self.cookies_browser = None  # e.g. "chrome", "firefox" - for age-restricted videos
         self.song_folders = []
         self.current_song_index = 0
         self.processing = False
@@ -123,15 +124,37 @@ class CloneHeroVideoDownloader:
                                            command=self.toggle_auto_fetch,
                                            onvalue=True, offvalue=False)
         self.auto_fetch_cb.grid(row=4, column=0, padx=20, pady=10, sticky="n")
-        
+
+        # Browser cookies selection (needed for age-restricted videos)
+        self.cookies_label = ctk.CTkLabel(self.sidebar_frame, text="Cookies From Browser:")
+        self.cookies_label.grid(row=5, column=0, padx=20, pady=(10, 0))
+
+        self.cookies_combobox = ctk.CTkComboBox(self.sidebar_frame,
+                                               values=["None", "chrome", "firefox", "edge",
+                                                       "brave", "opera", "vivaldi", "chromium"])
+        self.cookies_combobox.grid(row=6, column=0, padx=20, pady=(5, 10))
+        self.cookies_combobox.set("None")  # default: don't use any browser's cookies
+
+        # Cookies.txt file (overrides the browser dropdown above when set; needed
+        # when the browser's live cookie store can't be read/decrypted directly,
+        # e.g. Chrome's App-Bound Encryption on Windows)
+        self.cookies_file_label = ctk.CTkLabel(self.sidebar_frame, text="Or Cookies File:")
+        self.cookies_file_label.grid(row=7, column=0, padx=20, pady=(10, 0))
+
+        self.cookies_file_path = ""
+        self.cookies_file_btn = ctk.CTkButton(self.sidebar_frame, text="Browse...",
+                                            command=self.select_cookies_file,
+                                            width=100)
+        self.cookies_file_btn.grid(row=8, column=0, padx=20, pady=(5, 10))
+
         # Appearance mode switcher
         self.appearance_mode_label = ctk.CTkLabel(self.sidebar_frame, text="Appearance Mode:")
-        self.appearance_mode_label.grid(row=5, column=0, padx=20, pady=(10, 0))
-        
-        self.appearance_mode_menu = ctk.CTkOptionMenu(self.sidebar_frame, 
+        self.appearance_mode_label.grid(row=9, column=0, padx=20, pady=(10, 0))
+
+        self.appearance_mode_menu = ctk.CTkOptionMenu(self.sidebar_frame,
                                                  values=["System", "Light", "Dark"],
                                                  command=self.change_appearance_mode)
-        self.appearance_mode_menu.grid(row=6, column=0, padx=20, pady=(5, 10))
+        self.appearance_mode_menu.grid(row=10, column=0, padx=20, pady=(5, 10))
         
         # Create main frame
         self.main_frame = ctk.CTkFrame(self.root)
@@ -207,7 +230,17 @@ class CloneHeroVideoDownloader:
             self.songs_folder = folder
             self.folder_path_var.set(folder)
             self.log(f"Selected folder: {folder}")
-    
+
+    def select_cookies_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select cookies.txt (Netscape format)",
+            filetypes=[("Cookies file", "*.txt"), ("All files", "*.*")])
+        if file_path:
+            self.cookies_file_path = file_path
+            # Show just the filename on the button so the sidebar stays narrow
+            self.cookies_file_btn.configure(text=os.path.basename(file_path))
+            self.log(f"Using cookies file: {file_path}")
+
     def log(self, message, verbose=True):
         """Log a message to the UI log and console"""
         if verbose:
@@ -233,7 +266,9 @@ class CloneHeroVideoDownloader:
         # Get selected video quality (strip "p" from the end)
         self.video_quality = self.quality_combobox.get().replace("p", "")
         self.auto_fetch = self.auto_fetch_var.get()
-        
+        cookies_choice = self.cookies_combobox.get()
+        self.cookies_browser = None if cookies_choice == "None" else cookies_choice
+
         # Reset progress
         self.current_song_index = 0
         self.progress_bar.set(0)
@@ -500,6 +535,32 @@ class CloneHeroVideoDownloader:
         # Just return the cleaned folder name without adding any keywords
         return cleaned
     
+    def get_cookie_args(self):
+        """yt-dlp args to authenticate as the logged-in browser user.
+
+        Needed for age-restricted videos, which yt-dlp otherwise can't
+        fetch full formats for without some form of login.
+
+        An exported cookies.txt file takes priority over reading a
+        browser's live cookie store directly, since the latter can fail
+        to decrypt on Windows when Chrome uses App-Bound Encryption.
+        """
+        if self.cookies_file_path:
+            return ["--cookies", self.cookies_file_path]
+        if self.cookies_browser:
+            return ["--cookies-from-browser", self.cookies_browser]
+        return []
+
+    def get_extractor_args(self):
+        """Combined extra args every yt-dlp invocation should get.
+
+        --js-runtimes node: YouTube now requires solving a JS signature/"n"
+        challenge to get real (non-thumbnail-only) formats. yt-dlp needs an
+        external JS runtime to do this (see yt-dlp wiki page "EJS"); Deno is
+        the default but Node also works and is more commonly preinstalled.
+        """
+        return [*self.get_cookie_args(), "--js-runtimes", "node"]
+
     def download_video(self, song_name, song_path):
         self.log(f"Processing: {song_name}")
         
@@ -848,11 +909,12 @@ class CloneHeroVideoDownloader:
         self.log(f"Searching YouTube for top results...")
         
         cmd = [
-            "yt-dlp", "--no-download", 
+            "yt-dlp", "--no-download",
             "--print", "title",
             "--print", "id",
             "--print", "duration",
             "--print", "view_count",
+            *self.get_extractor_args(),
             search_query
         ]
         
@@ -1230,7 +1292,8 @@ class CloneHeroVideoDownloader:
             try:
                 # First verify the video exists and is downloadable
                 verify_cmd = [
-                    "yt-dlp", "--no-download", "--print", "title", 
+                    "yt-dlp", "--no-download", "--print", "title",
+                    *self.get_extractor_args(),
                     video_url
                 ]
                 if sys.platform == 'win32':
@@ -1262,12 +1325,13 @@ class CloneHeroVideoDownloader:
             
             # Build the download command
             cmd = [
-                "yt-dlp", 
+                "yt-dlp",
                 "-f", format_option,
                 "--merge-output-format", "mp4",  # Target MP4 for initial download
                 "--no-playlist",
                 "--geo-bypass",
                 "--max-filesize", "100M",  # Limit file size to avoid huge downloads
+                *self.get_extractor_args(),
                 "-o", output_template,
                 video_url
             ]
