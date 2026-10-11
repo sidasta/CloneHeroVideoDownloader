@@ -49,6 +49,15 @@ def extract_video_id(url):
 
     return None
 
+# Optional: automatic video_start_time sync (needs numpy + scipy)
+try:
+    import sync_video
+    SYNC_AVAILABLE = True
+except ImportError as e:
+    sync_video = None
+    SYNC_AVAILABLE = False
+    SYNC_UNAVAILABLE_REASON = str(e)
+
 # Set customtkinter appearance
 ctk.set_appearance_mode("System")  # Modes: "System" (standard), "Dark", "Light"
 ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
@@ -57,8 +66,8 @@ class CloneHeroVideoDownloader:
     def __init__(self, root):
         self.root = root
         self.root.title("Clone Hero Video Downloader")
-        self.root.geometry("800x600")
-        self.root.minsize(650, 500)
+        self.root.geometry("800x680")
+        self.root.minsize(650, 650)
         
         self.songs_folder = ""
         self.video_quality = "720"
@@ -70,6 +79,10 @@ class CloneHeroVideoDownloader:
         self.dialog_active = False  # Flag to track if a dialog is currently open
         self.auto_fetch = False  # Flag for auto-fetch mode
         self.skip_conversion = False  # Flag to skip current conversion
+        self.auto_sync = SYNC_AVAILABLE
+        self.sync_overwrite = False
+        self.sync_min_prominence = 6.0 if not SYNC_AVAILABLE else sync_video.DEFAULT_MIN_PROMINENCE
+        self.sync_flagged = []  # (song_name, SyncResult) needing manual review
         
         # Create a flag for ffmpeg path
         self.ffmpeg_path = "ffmpeg"  # default to system path
@@ -147,14 +160,45 @@ class CloneHeroVideoDownloader:
                                             width=100)
         self.cookies_file_btn.grid(row=8, column=0, padx=20, pady=(5, 10))
 
+        # Video sync: estimate video_start_time from the audio after each download
+        self.sync_frame = ctk.CTkFrame(self.sidebar_frame)
+        self.sync_frame.grid(row=9, column=0, padx=15, pady=(10, 5), sticky="ew")
+        self.sync_frame.grid_columnconfigure(0, weight=1)
+
+        self.sync_label = ctk.CTkLabel(self.sync_frame, text="Video Sync",
+                                      font=ctk.CTkFont(weight="bold"))
+        self.sync_label.grid(row=0, column=0, columnspan=2, padx=10, pady=(5, 0), sticky="w")
+
+        self.auto_sync_var = ctk.BooleanVar(value=SYNC_AVAILABLE)
+        self.auto_sync_cb = ctk.CTkCheckBox(self.sync_frame, text="Auto-sync offset",
+                                          variable=self.auto_sync_var)
+        self.auto_sync_cb.grid(row=1, column=0, columnspan=2, padx=10, pady=(5, 0), sticky="w")
+
+        self.sync_overwrite_var = ctk.BooleanVar(value=False)
+        self.sync_overwrite_cb = ctk.CTkCheckBox(self.sync_frame, text="Overwrite existing",
+                                               variable=self.sync_overwrite_var)
+        self.sync_overwrite_cb.grid(row=2, column=0, columnspan=2, padx=10, pady=(5, 0), sticky="w")
+
+        self.sync_min_prominence_label = ctk.CTkLabel(self.sync_frame, text="Min confidence:")
+        self.sync_min_prominence_label.grid(row=3, column=0, padx=(10, 5), pady=5, sticky="w")
+        self.sync_min_prominence_var = tk.StringVar(value=str(self.sync_min_prominence))
+        self.sync_min_prominence_entry = ctk.CTkEntry(self.sync_frame, width=50,
+                                                     textvariable=self.sync_min_prominence_var)
+        self.sync_min_prominence_entry.grid(row=3, column=1, padx=(0, 10), pady=5, sticky="e")
+
+        if not SYNC_AVAILABLE:
+            for widget in (self.auto_sync_cb, self.sync_overwrite_cb, self.sync_min_prominence_entry):
+                widget.configure(state="disabled")
+            self.sync_label.configure(text="Video Sync (needs numpy + scipy)")
+
         # Appearance mode switcher
         self.appearance_mode_label = ctk.CTkLabel(self.sidebar_frame, text="Appearance Mode:")
-        self.appearance_mode_label.grid(row=9, column=0, padx=20, pady=(10, 0))
+        self.appearance_mode_label.grid(row=10, column=0, padx=20, pady=(10, 0))
 
         self.appearance_mode_menu = ctk.CTkOptionMenu(self.sidebar_frame,
                                                  values=["System", "Light", "Dark"],
                                                  command=self.change_appearance_mode)
-        self.appearance_mode_menu.grid(row=10, column=0, padx=20, pady=(5, 10))
+        self.appearance_mode_menu.grid(row=11, column=0, padx=20, pady=(5, 10))
         
         # Create main frame
         self.main_frame = ctk.CTkFrame(self.root)
@@ -268,6 +312,14 @@ class CloneHeroVideoDownloader:
         self.auto_fetch = self.auto_fetch_var.get()
         cookies_choice = self.cookies_combobox.get()
         self.cookies_browser = None if cookies_choice == "None" else cookies_choice
+        self.auto_sync = SYNC_AVAILABLE and self.auto_sync_var.get()
+        self.sync_overwrite = self.sync_overwrite_var.get()
+        try:
+            self.sync_min_prominence = float(self.sync_min_prominence_var.get())
+        except ValueError:
+            self.show_error_dialog("Sync min confidence must be a number (default 6.0).")
+            return
+        self.sync_flagged = []
 
         # Reset progress
         self.current_song_index = 0
@@ -367,10 +419,12 @@ class CloneHeroVideoDownloader:
             self.root.update_idletasks()
             
             # Check if video already exists
-            if os.path.exists(video_file):
+            had_video = os.path.exists(video_file)
+            if had_video:
                 # If skip_all_existing is set, don't ask and just skip
                 if self.skip_all_existing:
                     self.log(f"Skipping {song_folder} (video already exists - Skip All active)")
+                    self.run_video_sync(song_folder, song_path)
                     i += 1
                     continue
                 
@@ -391,11 +445,13 @@ class CloneHeroVideoDownloader:
                 
                 if response == "skip":
                     self.log(f"Skipping {song_folder} (video already exists)")
+                    self.run_video_sync(song_folder, song_path)
                     i += 1
                     continue
                 elif response == "skip_all":
                     self.log(f"Skipping {song_folder} and all remaining songs with existing videos")
                     self.skip_all_existing = True
+                    self.run_video_sync(song_folder, song_path)
                     i += 1
                     continue
                 elif response == "stop":
@@ -407,7 +463,9 @@ class CloneHeroVideoDownloader:
             try:
                 # Download video from YouTube
                 success = self.download_video(song_folder, song_path)
-                if not success:
+                if success:
+                    self.run_video_sync(song_folder, song_path, video_replaced=had_video)
+                else:
                     self.log(f"Failed to process {song_folder}. Moving to next song.")
             except Exception as e:
                 self.log(f"Error processing {song_folder}: {str(e)}")
@@ -582,6 +640,42 @@ class CloneHeroVideoDownloader:
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
         )
+
+    def run_video_sync(self, song_name, song_path, video_replaced=False):
+        """Estimate and write video_start_time for one song folder. Never
+        raises: a sync problem shouldn't count as a failed download."""
+        if not self.auto_sync:
+            return
+        self.update_status(f"Syncing video offset: {song_name}")
+        try:
+            result = sync_video.sync_folder(song_path, apply=True,
+                                            overwrite=self.sync_overwrite,
+                                            min_prominence=self.sync_min_prominence,
+                                            ffmpeg=self.ffmpeg_path)
+        except Exception as e:
+            self.log(f"Video sync error: {e}")
+            self.sync_flagged.append((song_name, f"error: {e}"))
+            return
+
+        if result.status == "ok":
+            self.log(f"Video sync: wrote video_start_time = {result.offset_ms} ms "
+                     f"(confidence {result.prominence:.1f})")
+        elif result.status == "low-confidence":
+            self.log(f"Video sync: low confidence ({result.prominence:.1f}) - estimated "
+                     f"{result.offset_ms} ms was NOT written, check manually")
+            self.sync_flagged.append((song_name, f"low confidence, estimated {result.offset_ms} ms"))
+        elif result.status == "skipped-existing":
+            if video_replaced:
+                # The old offset was measured against the previous video file
+                self.log("Video sync: kept existing video_start_time, but the video was just replaced "
+                         "so it may no longer match - tick 'Overwrite existing' to recalculate")
+            else:
+                self.log("Video sync: song.ini already has video_start_time, skipped")
+        elif result.status == "missing-files":
+            self.log(f"Video sync: skipped ({result.message})")
+        else:
+            self.log(f"Video sync error: {result.message}")
+            self.sync_flagged.append((song_name, f"error: {result.message}"))
 
     def download_video(self, song_name, song_path):
         self.log(f"Processing: {song_name}")
@@ -1444,6 +1538,10 @@ class CloneHeroVideoDownloader:
         self.progress_bar.set(100)
         self.update_status("Finished")
         self.log("Processing completed!")
+        if self.sync_flagged:
+            self.log(f"\nVideo sync needs manual review for {len(self.sync_flagged)} song(s):")
+            for song_name, reason in self.sync_flagged:
+                self.log(f"  - {song_name}: {reason}")
 
     def toggle_auto_fetch(self):
         self.auto_fetch = self.auto_fetch_var.get()
