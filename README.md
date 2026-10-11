@@ -105,9 +105,17 @@ YouTube only serves age-restricted videos to a logged-in account. The app can us
 - **Cookies From Browser:** pick your browser from the dropdown. This reads the browser's cookie store directly.
 - **Or Cookies File:** export a `cookies.txt` file (Netscape format) with a browser extension such as "Get cookies.txt LOCALLY" while logged in to YouTube, then select it with "Browse...". A cookies file takes priority over the dropdown.
 
-On Windows, current versions of Chrome encrypt their cookie store in a way yt-dlp can't read ("Failed to decrypt with DPAPI"), so with Chrome use a cookies file. Cookies expire, so re-export the file if age-restricted downloads start failing again.
+On Windows, current versions of Chrome encrypt their cookie store in a way yt-dlp can't read ("Failed to decrypt with DPAPI"), so with Chrome use a cookies file.
 
-A cookies file contains your YouTube login, so keep it private and don't commit or share it.
+YouTube replaces its login cookies every so often while it's open in a normal browser tab, and a cookies file exported from that session stops working when they change, sometimes within an hour. To export a file that keeps working:
+
+1. Open a private (Incognito) window and log in to YouTube.
+2. In that same tab, go to `https://www.youtube.com/robots.txt`, so no YouTube page is left open.
+3. Export the cookies with the extension, then close the private window and don't reopen that session.
+
+In Chrome, extensions don't run in Incognito windows until you turn on "Allow in Incognito" in the extension's details. If age-restricted downloads start failing again, export a fresh file the same way.
+
+A cookies file contains your YouTube login, so keep it private and don't commit or share it. Using an account with yt-dlp also carries some risk of YouTube restricting or banning it, especially with heavy use, so consider a spare account.
 
 ## Video Sync
 
