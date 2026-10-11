@@ -1147,6 +1147,8 @@ class CloneHeroVideoDownloader:
                     result = subprocess.run(verify_cmd, capture_output=True, text=True)
                 if not result.stdout.strip():
                     self.log(f"Error: The custom URL could not be verified or is not a valid YouTube video: {video_url}")
+                    if result.stderr.strip():
+                        self.log(f"yt-dlp stderr:\n{result.stderr.strip()[-1000:]}")
                     return None
                     
                 self.log(f"Custom URL verified. Found video: {result.stdout.strip()}")
@@ -1174,17 +1176,17 @@ class CloneHeroVideoDownloader:
             self.log(f"Downloading video at {self.video_quality}p...")
             if sys.platform == 'win32':
                 process = create_hidden_process(
-                    cmd, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE,
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # merge so errors aren't lost in an unread pipe
                     universal_newlines=True,
                     bufsize=1  # Line buffered
                 )
             else:
                 process = subprocess.Popen(
-                    cmd, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE,
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # merge so errors aren't lost in an unread pipe
                     universal_newlines=True,
                     bufsize=1  # Line buffered
                 )
@@ -1210,8 +1212,8 @@ class CloneHeroVideoDownloader:
             # Check if the download was successful
             if process.returncode != 0:
                 self.log(f"Download failed with exit code {process.returncode}")
-                error_info = "\n".join(download_output[-5:]) if download_output else "No output captured"
-                self.log(f"Download error details (last 5 lines):\n{error_info}")
+                error_info = "\n".join(download_output[-20:]) if download_output else "No output captured"
+                self.log(f"Download error details (last 20 lines):\n{error_info}")
                 continue
             
             # Find the downloaded video file
