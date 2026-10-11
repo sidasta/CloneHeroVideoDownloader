@@ -2,7 +2,7 @@
 
 A Windows desktop application that automatically downloads background videos for Clone Hero (and YARG) songs from YouTube, converts them to the required `.webm` format with VP8 codec, and can set each video's sync offset automatically.
 
-![Image](https://github.com/user-attachments/assets/8844234e-98be-49f2-ba3a-b621a3bd2139)
+![Clone Hero Video Downloader downloading and converting a video, with the cookies and video sync options in the sidebar](docs/screenshot.png)
 
 ## Features
 
