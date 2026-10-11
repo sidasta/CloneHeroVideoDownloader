@@ -30,6 +30,25 @@ def create_hidden_process(cmd, **kwargs):
     
     return subprocess.Popen(cmd, **kwargs)
 
+# Extract video ID from different YouTube URL formats
+def extract_video_id(url):
+    # Regular YouTube URL: https://www.youtube.com/watch?v=VIDEO_ID
+    match = re.search(r'youtube\.com/watch\?v=([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+
+    # Shortened URL: https://youtu.be/VIDEO_ID
+    match = re.search(r'youtu\.be/([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+
+    # Embed URL: https://www.youtube.com/embed/VIDEO_ID
+    match = re.search(r'youtube\.com/embed/([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+
+    return None
+
 # Set customtkinter appearance
 ctk.set_appearance_mode("System")  # Modes: "System" (standard), "Dark", "Light"
 ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
@@ -510,13 +529,18 @@ class CloneHeroVideoDownloader:
             video_results = self.get_search_results(search_query)
             
             if not video_results:
-                self.log(f"No videos found for {song_name}")
-                return False
-            
+                self.log(f"No videos found automatically for {song_name}")
+                if self.auto_fetch:
+                    # No one is watching to answer a dialog in auto-fetch mode
+                    return False
+                selected_video = self.show_no_results_dialog(song_name)
+                if not selected_video or selected_video == "cancel":
+                    self.log("No URL supplied, skipping")
+                    return False
             # Show results to user if not in auto-fetch mode
-            if not self.auto_fetch and len(video_results) > 1:
+            elif not self.auto_fetch and len(video_results) > 1:
                 selected_video = self.show_video_selection(video_results, song_name)
-                if not selected_video:
+                if not selected_video or selected_video == "cancel":
                     self.log("Video selection canceled by user")
                     return False
             else:
@@ -965,27 +989,7 @@ class CloneHeroVideoDownloader:
                 }
                 
                 select_video(custom_video)
-                
-            # Extract video ID from different YouTube URL formats
-            def extract_video_id(url):
-                import re
-                # Regular YouTube URL: https://www.youtube.com/watch?v=VIDEO_ID
-                match = re.search(r'youtube\.com/watch\?v=([a-zA-Z0-9_-]+)', url)
-                if match:
-                    return match.group(1)
-                
-                # Shortened URL: https://youtu.be/VIDEO_ID
-                match = re.search(r'youtu\.be/([a-zA-Z0-9_-]+)', url)
-                if match:
-                    return match.group(1)
-                
-                # Embed URL: https://www.youtube.com/embed/VIDEO_ID
-                match = re.search(r'youtube\.com/embed/([a-zA-Z0-9_-]+)', url)
-                if match:
-                    return match.group(1)
-                
-                return None
-            
+
             # Create a card for each video option
             for i, video in enumerate(videos):
                 # Create a frame for each video with a nice card-like appearance
@@ -1113,6 +1117,102 @@ class CloneHeroVideoDownloader:
         while self.dialog_active and result["video"] is None:
             time.sleep(0.1)
         
+        self.dialog_active = False
+        return result["video"]
+
+    def show_no_results_dialog(self, song_name):
+        """Shown when YouTube search returns nothing. Lets the user paste a
+        direct YouTube URL for this song instead of just skipping it."""
+        self.dialog_active = True
+        result = {"video": None}
+
+        def show_dialog():
+            dialog = ctk.CTkToplevel(self.root)
+            dialog.title(f"No Videos Found for {song_name}")
+            dialog.geometry("500x230")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            dialog.grid_columnconfigure(0, weight=1)
+
+            content_frame = ctk.CTkFrame(dialog)
+            content_frame.grid(row=0, column=0, padx=20, pady=20, sticky="nsew")
+            content_frame.grid_columnconfigure(0, weight=1)
+
+            title_label = ctk.CTkLabel(content_frame,
+                                    text=f"No search results found for '{song_name}'",
+                                    font=ctk.CTkFont(size=14, weight="bold"),
+                                    wraplength=440, justify="left")
+            title_label.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="w")
+
+            subtitle_label = ctk.CTkLabel(content_frame,
+                                    text="Paste a YouTube URL for this song, or skip it.",
+                                    font=ctk.CTkFont(size=12),
+                                    wraplength=440, justify="left")
+            subtitle_label.grid(row=1, column=0, padx=10, pady=(0, 15), sticky="w")
+
+            def select_video(video):
+                result["video"] = video
+                dialog.destroy()
+
+            def on_dialog_close():
+                if result["video"] is None:
+                    result["video"] = "cancel"
+                dialog.destroy()
+
+            def use_custom_url():
+                url = url_var.get().strip()
+                if not url:
+                    messagebox.showerror("Error", "Please enter a valid YouTube URL")
+                    return
+
+                video_id = extract_video_id(url)
+                if not video_id:
+                    messagebox.showerror("Error", "Invalid YouTube URL format")
+                    return
+
+                custom_video = {
+                    'title': 'Custom URL',
+                    'id': video_id,
+                    'url': f'https://www.youtube.com/watch?v={video_id}',
+                    'duration': 0,
+                    'view_count': 0,
+                    'custom': True
+                }
+                select_video(custom_video)
+
+            url_var = tk.StringVar()
+            url_entry = ctk.CTkEntry(content_frame,
+                                   textvariable=url_var,
+                                   width=440,
+                                   placeholder_text="https://www.youtube.com/watch?v=...")
+            url_entry.grid(row=2, column=0, padx=10, pady=10, sticky="ew")
+            url_entry.bind("<Return>", lambda e: use_custom_url())
+
+            button_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+            button_frame.grid(row=3, column=0, padx=10, pady=(10, 0), sticky="ew")
+            button_frame.grid_columnconfigure((0, 1), weight=1)
+
+            custom_btn = ctk.CTkButton(button_frame,
+                                     text="Use This URL",
+                                     command=use_custom_url)
+            custom_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+
+            skip_btn = ctk.CTkButton(button_frame,
+                                     text="Skip This Song",
+                                     command=lambda: select_video("cancel"),
+                                     fg_color=("#DB3E39", "#821D1A"))
+            skip_btn.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+
+            dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+            url_entry.focus_set()
+
+            self.root.wait_window(dialog)
+
+        self.root.after(0, show_dialog)
+
+        while self.dialog_active and result["video"] is None:
+            time.sleep(0.1)
+
         self.dialog_active = False
         return result["video"]
 
