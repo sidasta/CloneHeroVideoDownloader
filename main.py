@@ -67,7 +67,6 @@ class CloneHeroVideoDownloader:
         self.root = root
         self.root.title("Clone Hero Video Downloader")
         self.root.geometry("800x680")
-        self.root.minsize(650, 650)
         
         self.songs_folder = ""
         self.video_quality = "720"
@@ -101,7 +100,14 @@ class CloneHeroVideoDownloader:
             print(f"Warning: Could not set ffmpeg path: {e}")
         
         self.setup_ui()
-        
+
+        # Size the minimum height to the layout. If the window is shorter than
+        # the sidebar needs, grid takes the shortfall from the weighted
+        # Auto-fetch row and the checkbox shrinks to nothing.
+        self.root.update_idletasks()
+        scaling = ctk.ScalingTracker.get_window_scaling(self.root)
+        self.root.minsize(650, int(self.root.winfo_reqheight() / scaling) + 1)
+
     def setup_ui(self):
         # Configure grid layout (4x4)
         self.root.grid_columnconfigure(1, weight=1)
