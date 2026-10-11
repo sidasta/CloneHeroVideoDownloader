@@ -561,6 +561,28 @@ class CloneHeroVideoDownloader:
         """
         return [*self.get_cookie_args(), "--js-runtimes", "node"]
 
+    def get_vp8_quality_settings(self):
+        """CRF target + max-bitrate ceiling for the WebM conversion, scaled
+        to the selected download resolution (self.video_quality)."""
+        settings = {
+            "1080": ("24", "8M"),
+            "720": ("26", "5M"),
+            "480": ("28", "2.5M"),
+            "360": ("30", "1.5M"),
+        }
+        return settings.get(self.video_quality, ("26", "4M"))
+
+    def get_pad_to_16x9_filter(self, width, height):
+        """ffmpeg -vf filter that fits the source into a WxH 16:9 canvas
+        without distorting it, padding with black bars on whichever sides
+        are needed (sides for vertical/portrait sources, top/bottom for
+        ultra-wide ones). Without this, YARG/Clone Hero crop a non-16:9
+        video to fill the screen instead of showing the whole frame."""
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+        )
+
     def download_video(self, song_name, song_path):
         self.log(f"Processing: {song_name}")
         
@@ -619,27 +641,42 @@ class CloneHeroVideoDownloader:
             # Convert to WebM with VP8 codec
             self.log("Converting to WebM with VP8 codec...")
             output_file = os.path.join(song_path, "video.webm")
-            
+
             # Reset skip flag before starting conversions
             self.skip_conversion = False
-            
+
+            # CRF (Constant Quality) target and a generous max-bitrate ceiling,
+            # scaled to the selected download resolution. A flat low bitrate
+            # (e.g. 1M) at 1080p badly under-allocates data for the pixel count
+            # and looks like upscaled 720p; CRF lets the encoder spend more
+            # bits on complex frames while still capping worst-case size.
+            crf, max_bitrate = self.get_vp8_quality_settings()
+
+            # Target resolution (used to pad non-16:9 sources instead of
+            # letting YARG/Clone Hero crop them to fill the screen)
+            target_resolutions = {"1080": (1920, 1080), "720": (1280, 720),
+                                   "480": (854, 480), "360": (640, 360)}
+            target_w, target_h = target_resolutions.get(self.video_quality, (1280, 720))
+            pad_filter = self.get_pad_to_16x9_filter(target_w, target_h)
+
             # Define conversion options to try
             conversion_options = [
-                # Option 1: Fast conversion with reasonable quality - using stderr for progress
+                # Option 1: Good quality constant-quality encode at full resolution
                 [
                     self.ffmpeg_path, "-y", "-i", downloaded_file,
                     "-c:v", "libvpx", "-c:a", "libvorbis",
-                    "-b:v", "1M", "-b:a", "128k",
-                    "-deadline", "good", "-cpu-used", "4",  # Increased CPU usage for speed
+                    "-vf", pad_filter,
+                    "-crf", crf, "-b:v", max_bitrate, "-b:a", "128k",
+                    "-deadline", "good", "-cpu-used", "2",
                     output_file
                 ],
                 # Option 2: More compatible settings with lower quality
                 [
                     self.ffmpeg_path, "-y", "-i", downloaded_file,
                     "-c:v", "libvpx", "-c:a", "libvorbis",
-                    "-b:v", "800k", "-b:a", "128k",
-                    "-deadline", "realtime", "-cpu-used", "8",  # Fastest settings
-                    "-vf", "scale=640:360",  # Lower resolution for faster encoding
+                    "-crf", "30", "-b:v", "1.5M", "-b:a", "128k",
+                    "-deadline", "good", "-cpu-used", "4",
+                    "-vf", self.get_pad_to_16x9_filter(640, 360),  # Lower resolution for faster encoding
                     "-threads", "4",
                     output_file
                 ],
@@ -647,8 +684,8 @@ class CloneHeroVideoDownloader:
                 [
                     self.ffmpeg_path, "-y", "-i", downloaded_file,
                     "-c:v", "vp8", "-c:a", "libvorbis",  # Try vp8 instead of libvpx
-                    "-b:v", "500k", "-b:a", "96k",
-                    "-vf", "scale=640:360",
+                    "-crf", "32", "-b:v", "1M", "-b:a", "96k",
+                    "-vf", self.get_pad_to_16x9_filter(640, 360),
                     output_file
                 ]
             ]
@@ -821,7 +858,7 @@ class CloneHeroVideoDownloader:
                                 "-c:v", "vp8", "-c:a", "libvorbis",  # Try vp8 instead of libvpx
                                 "-b:v", "800k", "-b:a", "128k",
                                 "-deadline", "good",
-                                "-vf", "scale=640:360",
+                                "-vf", self.get_pad_to_16x9_filter(640, 360),
                                 output_file
                             ]
                             self.log("Trying alternative codec conversion...")
@@ -851,7 +888,7 @@ class CloneHeroVideoDownloader:
                     final_cmd = [
                         self.ffmpeg_path, "-y", "-i", downloaded_file,
                         "-c:v", "libvpx", "-c:a", "libvorbis",
-                        "-vf", "scale=640:360",  # Low resolution
+                        "-vf", self.get_pad_to_16x9_filter(640, 360),  # Low resolution
                         "-b:v", "500k", "-b:a", "96k",  # Low bitrate
                         "-deadline", "realtime", "-cpu-used", "16",  # Fastest possible encoding
                         "-threads", "4", 
