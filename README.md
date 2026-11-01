@@ -21,7 +21,7 @@ A Windows desktop application that automatically downloads background videos for
 - Vertical and ultra-wide videos are padded to 16:9 so the game shows the whole frame instead of cropping it
 - Age-restricted videos via your browser's YouTube login (browser cookies or a cookies.txt file)
 - Automatic video sync: works out `video_start_time` for each song so the video lines up with the chart audio
-- Auto-fetch mode to automatically select the first result
+- Auto-fetch mode: picks the official music video automatically when it can tell, and saves the rest for you to choose at the end of the run
 - Skip or overwrite existing videos, with "Skip All" option
 
 ## Requirements
@@ -91,7 +91,7 @@ If you prefer to install dependencies manually:
 1. Run the application
 2. Click "Browse Folder" and select your Clone Hero Songs folder
 3. Choose your preferred video quality
-4. Enable "Auto-fetch Mode" if you want to automatically use the first result
+4. Enable "Auto-fetch Mode" to run unattended. It only takes a result whose title says "Official Video" / "Official Music Video" (and not lyric, audio, live, etc.) and whose length is within 15 seconds of the chart audio. Songs with no such result are moved to the end of the queue, where the usual video picker is shown for each one
 5. If you need age-restricted videos, set up cookies (see below)
 6. Leave "Auto-sync offset" ticked to set each song's video sync automatically (see below)
 7. Click "Start Processing"
@@ -126,7 +126,7 @@ A cookies file contains your YouTube login, so keep it private and don't commit 
 Music videos often have an intro, or an outro, that the chart audio doesn't, so the video plays out of time with the song unless `song.ini` has a `video_start_time` value. With "Auto-sync offset" ticked, the app works this out after each download by matching the video's soundtrack against the chart audio, and writes it to `song.ini`. A backup of the original is saved as `song.ini.bak`. It also runs for songs you skip because they already have a video, so you can sync an existing library.
 
 - **Overwrite existing:** by default, songs that already have a `video_start_time` are left alone. Tick this to recalculate them, for example after replacing a video.
-- **Min confidence:** offsets are only written when the audio match is clearly better than any other alignment. Matches scoring below this threshold (default 6.0) are not written, and are listed at the end of the run for you to check by hand. Lower it if correct matches are being rejected; raise it if wrong offsets are being written.
+- **Min confidence:** confidence measures how clearly the audio match beats any other alignment. Matches scoring below this threshold (default 6.0) are still written, but are listed at the end of the run (and appended to `video_sync_review.txt` in your Songs folder) for you to check by hand. Lower it if correct matches are being flagged; raise it if wrong offsets are getting through unflagged.
 
 The sync also works on its own from the command line, for example to process a folder of songs that already have videos:
 

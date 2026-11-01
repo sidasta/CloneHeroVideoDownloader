@@ -49,6 +49,16 @@ def extract_video_id(url):
 
     return None
 
+# Auto-fetch only takes a search result when it looks like the official music
+# video and its length is close to the chart audio; anything else is deferred
+# to the end of the run for manual selection.
+AUTO_FETCH_MAX_LENGTH_DIFF_S = 15
+OFFICIAL_VIDEO_RE = re.compile(r'official\s+(?:hd\s+|4k\s+)?(?:music\s+)?video', re.IGNORECASE)
+# "Official Video (Lyrics)", "Official Video - Live at ..." etc. aren't the music video
+NOT_MUSIC_VIDEO_WORDS = [re.compile(rf'\b{w}', re.IGNORECASE) for w in
+                         [r"lyric", r"audio\b", r"live\b", r"visuali", r"cover\b", r"karaoke",
+                          r"instrumental", r"reaction", r"remix", r"slowed\b", r"sped up\b"]]
+
 # Optional: automatic video_start_time sync (needs numpy + scipy)
 try:
     import sync_video
@@ -413,7 +423,8 @@ class CloneHeroVideoDownloader:
     def process_songs(self):
         total_songs = len(self.song_folders)
         i = 0
-        
+        deferred = []  # (song_folder, song_path, had_video, video_results)
+
         while i < total_songs and self.processing:
             song_folder = self.song_folders[i]
             self.current_song_index = i
@@ -465,22 +476,48 @@ class CloneHeroVideoDownloader:
                     break
             
             self.log(f"Processing: {song_folder}")
-            
-            try:
-                # Download video from YouTube
-                success = self.download_video(song_folder, song_path)
-                if success:
-                    self.run_video_sync(song_folder, song_path, video_replaced=had_video)
-                else:
-                    self.log(f"Failed to process {song_folder}. Moving to next song.")
-            except Exception as e:
-                self.log(f"Error processing {song_folder}: {str(e)}")
-            
+
+            result = self.fetch_and_sync(song_folder, song_path, had_video, auto=self.auto_fetch)
+            if isinstance(result, tuple):
+                deferred.append((song_folder, song_path, had_video, result[1]))
+
             # Move to next song regardless of success or failure
             i += 1
-        
+
+        # Songs auto-fetch wasn't sure about, now with the picker shown
+        if deferred and self.processing:
+            self.log(f"\nAuto-fetch deferred {len(deferred)} song(s) for manual selection:")
+            for song_folder, _, _, _ in deferred:
+                self.log(f"  - {song_folder}")
+            for n, (song_folder, song_path, had_video, video_results) in enumerate(deferred):
+                if not self.processing:
+                    break
+                self.update_status(f"Manual selection {n+1}/{len(deferred)}: {song_folder}")
+                self.progress_bar.set(n / len(deferred))
+                self.root.update_idletasks()
+                self.fetch_and_sync(song_folder, song_path, had_video, auto=False,
+                                    video_results=video_results)
+
         # Update UI when done
         self.root.after(0, self.processing_finished)
+
+    def fetch_and_sync(self, song_folder, song_path, had_video, auto, video_results=None):
+        """Download one song's video and sync it. Passes through download_video's
+        result so the caller can spot a deferred song."""
+        try:
+            # Download video from YouTube
+            result = self.download_video(song_folder, song_path, auto=auto,
+                                         video_results=video_results)
+            if isinstance(result, tuple):
+                return result
+            if result:
+                self.run_video_sync(song_folder, song_path, video_replaced=had_video)
+            else:
+                self.log(f"Failed to process {song_folder}. Moving to next song.")
+            return result
+        except Exception as e:
+            self.log(f"Error processing {song_folder}: {str(e)}")
+            return False
     
     def ask_overwrite(self, song_name):
         # This function will be called from the processing thread
@@ -657,7 +694,8 @@ class CloneHeroVideoDownloader:
             result = sync_video.sync_folder(song_path, apply=True,
                                             overwrite=self.sync_overwrite,
                                             min_prominence=self.sync_min_prominence,
-                                            ffmpeg=self.ffmpeg_path)
+                                            ffmpeg=self.ffmpeg_path,
+                                            apply_low_confidence=True)
         except Exception as e:
             self.log(f"Video sync error: {e}")
             self.sync_flagged.append((song_name, f"error: {e}"))
@@ -667,9 +705,10 @@ class CloneHeroVideoDownloader:
             self.log(f"Video sync: wrote video_start_time = {result.offset_ms} ms "
                      f"(confidence {result.prominence:.1f})")
         elif result.status == "low-confidence":
-            self.log(f"Video sync: low confidence ({result.prominence:.1f}) - estimated "
-                     f"{result.offset_ms} ms was NOT written, check manually")
-            self.sync_flagged.append((song_name, f"low confidence, estimated {result.offset_ms} ms"))
+            self.log(f"Video sync: low confidence ({result.prominence:.1f}) - wrote "
+                     f"video_start_time = {result.offset_ms} ms anyway, check manually")
+            self.sync_flagged.append((song_name, f"low confidence ({result.prominence:.1f}), "
+                                                 f"wrote {result.offset_ms} ms"))
         elif result.status == "skipped-existing":
             if video_replaced:
                 # The old offset was measured against the previous video file
@@ -683,21 +722,88 @@ class CloneHeroVideoDownloader:
             self.log(f"Video sync error: {result.message}")
             self.sync_flagged.append((song_name, f"error: {result.message}"))
 
-    def download_video(self, song_name, song_path):
+    def get_audio_length(self, song_path):
+        """Length in seconds of the chart audio (longest .ogg stem, via
+        ffprobe), falling back to song_length in song.ini. None if unknown."""
+        ffprobe = "ffprobe"
+        if os.path.isabs(self.ffmpeg_path):
+            local_ffprobe = os.path.join(os.path.dirname(self.ffmpeg_path), "ffprobe.exe")
+            if os.path.exists(local_ffprobe):
+                ffprobe = local_ffprobe
+
+        lengths = []
+        for name in os.listdir(song_path):
+            if not name.lower().endswith(".ogg"):
+                continue
+            cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                   "-of", "default=noprint_wrappers=1:nokey=1", os.path.join(song_path, name)]
+            try:
+                kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, **kwargs)
+                lengths.append(float(result.stdout.strip()))
+            except Exception:
+                pass
+        if lengths:
+            return max(lengths)
+
+        ini_path = os.path.join(song_path, "song.ini")
+        try:
+            with open(ini_path, encoding="utf-8-sig", errors="replace") as f:
+                for line in f:
+                    key, _, value = line.partition("=")
+                    if key.strip().lower() == "song_length":
+                        return int(value.strip()) / 1000
+        except Exception:
+            pass
+        return None
+
+    def pick_auto_fetch_video(self, videos, song_name, audio_length):
+        """First search result that looks like the official music video and
+        is close in length to the chart audio, or None if nothing qualifies."""
+        for video in videos:
+            title = video['title']
+            if not OFFICIAL_VIDEO_RE.search(title):
+                self.log(f"Auto-fetch: rejected '{title}' (not an official video)")
+                continue
+            # Ignore a word if the song/artist name itself contains it ("Live and Let Die")
+            bad_words = [m.group(0) for w in NOT_MUSIC_VIDEO_WORDS
+                         if (m := w.search(title)) and not w.search(song_name)]
+            if bad_words:
+                self.log(f"Auto-fetch: rejected '{title}' (title contains '{bad_words[0]}')")
+                continue
+            if audio_length is None:
+                self.log(f"Auto-fetch: rejected '{title}' (chart audio length unknown)")
+                continue
+            try:
+                video_length = float(video['duration'])
+            except (TypeError, ValueError):
+                self.log(f"Auto-fetch: rejected '{title}' (video length unknown)")
+                continue
+            diff = abs(video_length - audio_length)
+            if diff > AUTO_FETCH_MAX_LENGTH_DIFF_S:
+                self.log(f"Auto-fetch: rejected '{title}' (length differs by {diff:.0f}s)")
+                continue
+            self.log(f"Auto-fetch: matched '{title}' (length differs by {diff:.0f}s)")
+            return video
+        return None
+
+    def download_video(self, song_name, song_path, auto=False, video_results=None):
+        """Returns True on success, False on failure, or a ("deferred",
+        video_results) tuple when auto-fetch found no confident match."""
         self.log(f"Processing: {song_name}")
-        
+
         # Sanitize song name for better search results
         search_term = self.sanitize_song_name(song_name)
         self.log(f"Search query: {search_term}")
-        
+
         # Create temporary download directory
         temp_dir = os.path.join(song_path, "temp_download")
         os.makedirs(temp_dir, exist_ok=True)
-        
+
         try:
             # Get top 3 results from YouTube instead of just one
             search_query = f"ytsearch3:{search_term}"
-            
+
             # Try alternative formats if the first one fails
             format_options = [
                 # First try: Specific format for quality control
@@ -708,28 +814,35 @@ class CloneHeroVideoDownloader:
                 "bestvideo+bestaudio/best" 
             ]
             
-            # Get search results first
-            video_results = self.get_search_results(search_query)
-            
-            if not video_results:
+            # Get search results first (deferred songs reuse their earlier search)
+            if video_results is None:
+                video_results = self.get_search_results(search_query)
+
+            if auto:
+                # No one is watching to answer a dialog in auto-fetch mode, so
+                # anything uncertain waits for the manual pass at the end
+                selected_video = None
+                if video_results:
+                    selected_video = self.pick_auto_fetch_video(
+                        video_results, song_name, self.get_audio_length(song_path))
+                else:
+                    self.log(f"No videos found automatically for {song_name}")
+                if not selected_video:
+                    self.log(f"Auto-fetch: no confident match, deferring {song_name} to the end")
+                    return ("deferred", video_results)
+            elif not video_results:
                 self.log(f"No videos found automatically for {song_name}")
-                if self.auto_fetch:
-                    # No one is watching to answer a dialog in auto-fetch mode
-                    return False
                 selected_video = self.show_no_results_dialog(song_name)
                 if not selected_video or selected_video == "cancel":
                     self.log("No URL supplied, skipping")
                     return False
-            # Show results to user if not in auto-fetch mode
-            elif not self.auto_fetch and len(video_results) > 1:
+            # Show results to user if not in auto-fetch mode, even a single
+            # result (it may be one auto-fetch already rejected)
+            else:
                 selected_video = self.show_video_selection(video_results, song_name)
                 if not selected_video or selected_video == "cancel":
                     self.log("Video selection canceled by user")
                     return False
-            else:
-                # In auto-fetch mode, just use the first result
-                selected_video = video_results[0]
-                self.log(f"Auto-fetch mode: Selected first result - {selected_video['title']}")
             
             # Download the selected video
             downloaded_file = self.download_selected_video(selected_video, temp_dir, format_options)
@@ -1548,6 +1661,17 @@ class CloneHeroVideoDownloader:
             self.log(f"\nVideo sync needs manual review for {len(self.sync_flagged)} song(s):")
             for song_name, reason in self.sync_flagged:
                 self.log(f"  - {song_name}: {reason}")
+            # Low-confidence offsets are written to song.ini, so later runs skip
+            # these songs - keep the list somewhere that outlives the log window
+            review_file = os.path.join(self.songs_folder, "video_sync_review.txt")
+            try:
+                with open(review_file, "a", encoding="utf-8") as f:
+                    f.write(f"--- {time.strftime('%Y-%m-%d %H:%M')} ---\n")
+                    for song_name, reason in self.sync_flagged:
+                        f.write(f"{song_name}: {reason}\n")
+                self.log(f"Review list saved to {review_file}")
+            except Exception as e:
+                self.log(f"Warning: Could not save review list: {e}")
 
     def toggle_auto_fetch(self):
         self.auto_fetch = self.auto_fetch_var.get()

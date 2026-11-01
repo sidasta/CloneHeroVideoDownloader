@@ -199,8 +199,10 @@ class SyncResult:
 
 def sync_folder(folder: Path, apply: bool = False, overwrite: bool = False,
                 min_prominence: float = DEFAULT_MIN_PROMINENCE,
-                ffmpeg: str | None = None) -> SyncResult:
-    """Estimate (and optionally write) video_start_time for one song folder."""
+                ffmpeg: str | None = None,
+                apply_low_confidence: bool = False) -> SyncResult:
+    """Estimate (and optionally write) video_start_time for one song folder.
+    Low-confidence estimates are only written if apply_low_confidence."""
     folder = Path(folder)
     video = folder / "video.webm"
     ini = folder / "song.ini"
@@ -215,7 +217,7 @@ def sync_folder(folder: Path, apply: bool = False, overwrite: bool = False,
 
     status = "ok" if prominence >= min_prominence else "low-confidence"
     result = SyncResult(status, offset_ms, similarity, prominence)
-    if apply and status == "ok":
+    if apply and (status == "ok" or apply_low_confidence):
         update_ini(ini, offset_ms)
         result.applied = True
     return result
