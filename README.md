@@ -2,7 +2,7 @@
 
 > **This is a fork of [Shonitbar/CloneHeroVideoDownloader](https://github.com/Shonitbar/CloneHeroVideoDownloader)**, which hasn't been updated since v1.0.0. It fixes downloads that broke with later YouTube changes, and adds age-restricted video support, better conversion quality and automatic video sync. See the commit history for details.
 >
-> There's no prebuilt executable for this fork yet, so run it from source. The Releases link below is the original v1.0.0 build, which doesn't include these changes.
+> There's no prebuilt executable for this fork yet, so run it from source: download the source zip from this fork's [Releases](https://github.com/sidasta/CloneHeroVideoDownloader/releases) page, or clone the repository. The standalone executable link further down is the original v1.0.0 build, which doesn't include these changes.
 
 A Windows desktop application that automatically downloads background videos for Clone Hero (and YARG) songs from YouTube, converts them to the required `.webm` format with VP8 codec, and can set each video's sync offset automatically.
 
