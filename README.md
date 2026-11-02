@@ -19,6 +19,7 @@ A Windows desktop application that automatically downloads background videos for
 - Downloads the video and converts to WebM format with VP8 codec (required by Clone Hero)
 - Option to select video quality (360p, 480p, 720p, 1080p); encoding quality scales with it
 - Vertical and ultra-wide videos are padded to 16:9 so the game shows the whole frame instead of cropping it
+- Black bars already baked into an upload (e.g. a widescreen film letterboxed inside a 4:3 video) are cropped off first, so the picture isn't boxed in on all four sides
 - Age-restricted videos via your browser's YouTube login (browser cookies or a cookies.txt file)
 - Automatic video sync: works out `video_start_time` for each song so the video lines up with the chart audio
 - Auto-fetch mode: picks the official music video automatically when it can tell, and saves the rest for you to choose at the end of the run
@@ -135,6 +136,16 @@ python sync_video.py "C:\path\to\Songs" --apply
 ```
 
 Without `--apply` it only prints what it would write. Use `--overwrite` to recalculate existing values and `--help` for all options.
+
+## Checking Videos From Older Versions
+
+Versions before 1.2.0 could leave some broken videos behind. To find them, run:
+
+```
+python scan_boxed_videos.py "C:\path\to\Songs"
+```
+
+It lists videos whose picture is boxed in on all four sides (black bars that were already in the YouTube upload, plus the 16:9 padding), and videos it couldn't analyse, which are usually ones that were cut short. Delete those and download them again. Videos with no picture at all (audio only) aren't detected, but they stand out by file size: a few MB for a whole song.
 
 ## Notes
 

@@ -5,6 +5,7 @@ from tkinter import filedialog, messagebox
 import threading
 import re
 import time
+import math
 import shutil
 import customtkinter as ctk
 import sys
@@ -13,6 +14,11 @@ import sys
 if sys.platform == 'win32':
     import ctypes
     from subprocess import STARTUPINFO, STARTF_USESHOWWINDOW, SW_HIDE
+
+# ffmpeg writes UTF-8, and every subprocess read below decodes as UTF-8 (the
+# Windows default, cp1252, crashes on titles like "강남스타일"). yt-dlp is a
+# Python program, so this makes it write UTF-8 too.
+os.environ["PYTHONIOENCODING"] = "utf-8"
 
 # Function to create a subprocess with hidden console window
 def create_hidden_process(cmd, **kwargs):
@@ -58,6 +64,14 @@ OFFICIAL_VIDEO_RE = re.compile(r'official\s+(?:hd\s+|4k\s+)?(?:music\s+)?video',
 NOT_MUSIC_VIDEO_WORDS = [re.compile(rf'\b{w}', re.IGNORECASE) for w in
                          [r"lyric", r"audio\b", r"live\b", r"visuali", r"cover\b", r"karaoke",
                           r"instrumental", r"reaction", r"remix", r"slowed\b", r"sped up\b"]]
+
+# Black bars already in a downloaded video are only cropped off when they
+# take up at least this much of the frame's width or height
+CROP_MIN_BAR_FRACTION = 0.05
+
+# Largest single YouTube stream to download, to avoid huge downloads. A
+# 5 minute 1080p music video is typically 100-150MB.
+MAX_STREAM_SIZE = "400M"
 
 # Optional: automatic video_start_time sync (needs numpy + scipy)
 try:
@@ -673,16 +687,127 @@ class CloneHeroVideoDownloader:
         }
         return settings.get(self.video_quality, ("26", "4M"))
 
-    def get_pad_to_16x9_filter(self, width, height):
+    def get_pad_to_16x9_filter(self, width, height, crop=None):
         """ffmpeg -vf filter that fits the source into a WxH 16:9 canvas
         without distorting it, padding with black bars on whichever sides
         are needed (sides for vertical/portrait sources, top/bottom for
         ultra-wide ones). Without this, YARG/Clone Hero crop a non-16:9
-        video to fill the screen instead of showing the whole frame."""
+        video to fill the screen instead of showing the whole frame.
+
+        crop is an optional (w, h, x, y) from detect_burned_in_bars, applied
+        first so bars already in the source aren't boxed in a second time."""
+        crop_filter = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
         return (
+            f"{crop_filter}"
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
         )
+
+    def get_ffprobe_path(self):
+        if os.path.isabs(self.ffmpeg_path):
+            local_ffprobe = os.path.join(os.path.dirname(self.ffmpeg_path), "ffprobe.exe")
+            if os.path.exists(local_ffprobe):
+                return local_ffprobe
+        return "ffprobe"
+
+    def has_video_stream(self, path):
+        """True if ffprobe finds a video track in the file."""
+        kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
+        try:
+            result = subprocess.run([self.get_ffprobe_path(), "-v", "error", "-select_streams", "v",
+                                     "-show_entries", "stream=codec_type",
+                                     "-of", "default=noprint_wrappers=1:nokey=1", path],
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, **kwargs)
+            return "video" in result.stdout
+        except Exception:
+            return False
+
+    def get_media_duration(self, path):
+        """Length of a media file in seconds, or None if ffprobe can't tell."""
+        kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
+        try:
+            result = subprocess.run([self.get_ffprobe_path(), "-v", "error", "-show_entries",
+                                     "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+                                     path], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, **kwargs)
+            return float(result.stdout.strip())
+        except Exception:
+            return None
+
+    def detect_burned_in_bars(self, video_file):
+        """Find black bars baked into the source picture (e.g. a 2.35:1 film
+        letterboxed inside a 4:3 upload) and return the (w, h, x, y) crop that
+        removes them, or None to leave the picture alone.
+
+        Samples several short clips spread through the video and keeps the
+        least aggressive crop seen, so a dark scene or fade can't trick it
+        into cutting into the picture: any bright frame shows the true edges.
+        Bars thinner than CROP_MIN_BAR_FRACTION of the frame are ignored."""
+        kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
+        try:
+            probe = subprocess.run(
+                [self.get_ffprobe_path(), "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height:format=duration",
+                 "-of", "default=noprint_wrappers=1", video_file],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, **kwargs)
+            info = dict(line.split("=", 1) for line in probe.stdout.splitlines() if "=" in line)
+            src_w, src_h = int(info["width"]), int(info["height"])
+            duration = float(info["duration"])
+        except Exception as e:
+            self.log(f"Bar detection skipped (couldn't read video info: {e})")
+            return None
+
+        # Skip the first/last few seconds, where fades from black are most likely
+        start, end = min(5.0, duration * 0.1), max(0.0, duration - min(5.0, duration * 0.1) - 2)
+        samples = 8
+        boxes = []
+        for n in range(samples):
+            t = start + (end - start) * n / (samples - 1)
+            cmd = [self.ffmpeg_path, "-hide_banner", "-ss", f"{t:.2f}", "-i", video_file,
+                   "-t", "2", "-an", "-vf", "cropdetect=limit=24:round=2:reset=0",
+                   "-f", "null", "-"]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, **kwargs)
+            except Exception:
+                continue
+            found = re.findall(r'crop=(-?\d+):(-?\d+):(-?\d+):(-?\d+)', result.stderr)
+            if not found:
+                continue
+            w, h, x, y = map(int, found[-1])
+            # An all-black clip gives a nonsense (negative/empty) box - ignore it
+            if w > src_w * 0.1 and h > src_h * 0.1:
+                boxes.append((x, y, x + w, y + h))
+
+        if len(boxes) < 2:
+            return None
+
+        # Union of everything any sample saw as picture
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[2] for b in boxes)
+        y2 = max(b[3] for b in boxes)
+
+        # Cropping only helps on the axis that's "too long" for 16:9 (top/bottom
+        # for a 4:3 upload, sides for an ultra-wide one): bars on the other axis
+        # end up as padding anyway. And it never needs to go past 16:9, since
+        # any bar left inside that looks the same as the padding we'd add. This
+        # also limits a misdetection (e.g. a band on a dark stage) to at most
+        # trimming the frame to 16:9, rather than cropping into the picture.
+        x, y, w, h = 0, 0, src_w, src_h
+        if src_w * 9 < src_h * 16:
+            h = max(y2 - y1, round(src_w * 9 / 16))
+            y = min(max(0, (y1 + y2 - h) // 2), src_h - h)
+        elif src_w * 9 > src_h * 16:
+            w = max(x2 - x1, round(src_h * 16 / 9))
+            x = min(max(0, (x1 + x2 - w) // 2), src_w - w)
+
+        # Only crop when the bars are big enough to matter
+        if (src_w - w) < src_w * CROP_MIN_BAR_FRACTION and (src_h - h) < src_h * CROP_MIN_BAR_FRACTION:
+            return None
+
+        # Even offsets/sizes keep the 4:2:0 chroma planes aligned
+        x, y, w, h = x // 2 * 2, y // 2 * 2, w // 2 * 2, h // 2 * 2
+        self.log(f"Cropping bars burned into the source: {src_w}x{src_h} -> {w}x{h}")
+        return (w, h, x, y)
 
     def run_video_sync(self, song_name, song_path, video_replaced=False):
         """Estimate and write video_start_time for one song folder. Never
@@ -725,24 +850,9 @@ class CloneHeroVideoDownloader:
     def get_audio_length(self, song_path):
         """Length in seconds of the chart audio (longest .ogg stem, via
         ffprobe), falling back to song_length in song.ini. None if unknown."""
-        ffprobe = "ffprobe"
-        if os.path.isabs(self.ffmpeg_path):
-            local_ffprobe = os.path.join(os.path.dirname(self.ffmpeg_path), "ffprobe.exe")
-            if os.path.exists(local_ffprobe):
-                ffprobe = local_ffprobe
-
-        lengths = []
-        for name in os.listdir(song_path):
-            if not name.lower().endswith(".ogg"):
-                continue
-            cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration",
-                   "-of", "default=noprint_wrappers=1:nokey=1", os.path.join(song_path, name)]
-            try:
-                kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, **kwargs)
-                lengths.append(float(result.stdout.strip()))
-            except Exception:
-                pass
+        lengths = [self.get_media_duration(os.path.join(song_path, name))
+                   for name in os.listdir(song_path) if name.lower().endswith(".ogg")]
+        lengths = [length for length in lengths if length]
         if lengths:
             return max(lengths)
 
@@ -805,13 +915,20 @@ class CloneHeroVideoDownloader:
             search_query = f"ytsearch3:{search_term}"
 
             # Try alternative formats if the first one fails
+            # The size cap lives in the format selector rather than yt-dlp's
+            # --max-filesize: that flag silently skips an oversized video
+            # stream but still downloads the audio, leaving an audio-only file.
+            # Here yt-dlp instead picks the best stream that fits ("<?" lets
+            # through streams whose size YouTube doesn't report).
+            size = f"[filesize<?{MAX_STREAM_SIZE}]"
+            q = self.video_quality
             format_options = [
                 # First try: Specific format for quality control
-                f"bestvideo[height<={self.video_quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={self.video_quality}]",
+                f"bestvideo[height<={q}][ext=mp4]{size}+bestaudio[ext=m4a]/best[height<={q}]{size}",
                 # Second try: Any video format with desired height
-                f"bestvideo[height<={self.video_quality}]+bestaudio/best[height<={self.video_quality}]",
+                f"bestvideo[height<={q}]{size}+bestaudio/best[height<={q}]{size}",
                 # Third try: Just get the best quality available
-                "bestvideo+bestaudio/best" 
+                f"bestvideo{size}+bestaudio/best{size}"
             ]
             
             # Get search results first (deferred songs reuse their earlier search)
@@ -853,7 +970,12 @@ class CloneHeroVideoDownloader:
             
             # Convert to WebM with VP8 codec
             self.log("Converting to WebM with VP8 codec...")
-            output_file = os.path.join(song_path, "video.webm")
+            # Convert inside temp_dir and only move the result into place once
+            # ffmpeg finishes cleanly, so a timed-out, stopped or failed attempt
+            # can't leave a cut-short video.webm that later runs treat as done
+            # (or wipe out the existing video when replacing one)
+            final_file = os.path.join(song_path, "video.webm")
+            output_file = os.path.join(temp_dir, "_converting.webm")
 
             # Reset skip flag before starting conversions
             self.skip_conversion = False
@@ -870,7 +992,8 @@ class CloneHeroVideoDownloader:
             target_resolutions = {"1080": (1920, 1080), "720": (1280, 720),
                                    "480": (854, 480), "360": (640, 360)}
             target_w, target_h = target_resolutions.get(self.video_quality, (1280, 720))
-            pad_filter = self.get_pad_to_16x9_filter(target_w, target_h)
+            crop = self.detect_burned_in_bars(downloaded_file)
+            pad_filter = self.get_pad_to_16x9_filter(target_w, target_h, crop)
 
             # Define conversion options to try
             conversion_options = [
@@ -889,7 +1012,7 @@ class CloneHeroVideoDownloader:
                     "-c:v", "libvpx", "-c:a", "libvorbis",
                     "-crf", "30", "-b:v", "1.5M", "-b:a", "128k",
                     "-deadline", "good", "-cpu-used", "4",
-                    "-vf", self.get_pad_to_16x9_filter(640, 360),  # Lower resolution for faster encoding
+                    "-vf", self.get_pad_to_16x9_filter(640, 360, crop),  # Lower resolution for faster encoding
                     "-threads", "4",
                     output_file
                 ],
@@ -898,18 +1021,27 @@ class CloneHeroVideoDownloader:
                     self.ffmpeg_path, "-y", "-i", downloaded_file,
                     "-c:v", "vp8", "-c:a", "libvorbis",  # Try vp8 instead of libvpx
                     "-crf", "32", "-b:v", "1M", "-b:a", "96k",
-                    "-vf", self.get_pad_to_16x9_filter(640, 360),
+                    "-vf", self.get_pad_to_16x9_filter(640, 360, crop),
                     output_file
                 ]
             ]
             
+            # A flat 5 minute limit cut long 1080p encodes off partway (VP8 at
+            # 1080p can run well under real time), so allow a multiple of the
+            # video's length instead. Real hangs are still caught by the
+            # stuck-frame check below.
+            video_length = self.get_media_duration(downloaded_file)
+            realtime_multiple = {"1080": 5, "720": 3}.get(self.video_quality, 2)
+            max_duration_minutes = 5
+            if video_length:
+                max_duration_minutes = max(5, math.ceil(video_length * realtime_multiple / 60))
+
             conversion_success = False
             for i, cmd in enumerate(conversion_options):
                 self.log(f"Trying conversion method {i+1}...")
-                
+
                 try:
                     # Set a timeout for the conversion process
-                    max_duration_minutes = 5  # Reduced from 10 minutes
                     self.log(f"Setting timeout of {max_duration_minutes} minutes for conversion")
                     
                     # Get file info first
@@ -924,11 +1056,11 @@ class CloneHeroVideoDownloader:
                             startupinfo.wShowWindow = SW_HIDE
                             probe_result = subprocess.run(probe_cmd, 
                                                         capture_output=True, 
-                                                        text=True,
+                                                        text=True, encoding="utf-8", errors="replace",
                                                         startupinfo=startupinfo,
                                                         creationflags=subprocess.CREATE_NO_WINDOW)
                         else:
-                            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+                            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
                         self.log(f"Input file info: {probe_result.stderr[:200]}...")
                     except:
                         self.log("Couldn't get file info")
@@ -939,7 +1071,7 @@ class CloneHeroVideoDownloader:
                             cmd, 
                             stdout=subprocess.PIPE, 
                             stderr=subprocess.PIPE,
-                            universal_newlines=True,
+                            universal_newlines=True, encoding="utf-8", errors="replace",
                             bufsize=1  # Line buffered
                         )
                     else:
@@ -947,7 +1079,7 @@ class CloneHeroVideoDownloader:
                             cmd, 
                             stdout=subprocess.PIPE, 
                             stderr=subprocess.PIPE,
-                            universal_newlines=True,
+                            universal_newlines=True, encoding="utf-8", errors="replace",
                             bufsize=1  # Line buffered
                         )
                     
@@ -976,6 +1108,7 @@ class CloneHeroVideoDownloader:
                         # Check if processing was stopped by user
                         if not self.processing:
                             process.terminate()
+                            process.wait()  # release the file so temp_dir can be cleaned up
                             self.log("Conversion terminated by user")
                             return False
                         
@@ -1071,11 +1204,11 @@ class CloneHeroVideoDownloader:
                                 "-c:v", "vp8", "-c:a", "libvorbis",  # Try vp8 instead of libvpx
                                 "-b:v", "800k", "-b:a", "128k",
                                 "-deadline", "good",
-                                "-vf", self.get_pad_to_16x9_filter(640, 360),
+                                "-vf", self.get_pad_to_16x9_filter(640, 360, crop),
                                 output_file
                             ]
                             self.log("Trying alternative codec conversion...")
-                            alt_process = subprocess.run(alt_cmd, capture_output=True, text=True)
+                            alt_process = subprocess.run(alt_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
                             if alt_process.returncode == 0:
                                 self.log("Alternative codec conversion successful!")
                                 conversion_success = True
@@ -1084,6 +1217,7 @@ class CloneHeroVideoDownloader:
                 except subprocess.TimeoutExpired:
                     self.log(f"Conversion attempt {i+1} timed out during final communication")
                     process.terminate()
+                    process.wait()  # release the output file before the next attempt rewrites it
                 except Exception as e:
                     self.log(f"Error during conversion: {str(e)}")
                     import traceback
@@ -1101,7 +1235,7 @@ class CloneHeroVideoDownloader:
                     final_cmd = [
                         self.ffmpeg_path, "-y", "-i", downloaded_file,
                         "-c:v", "libvpx", "-c:a", "libvorbis",
-                        "-vf", self.get_pad_to_16x9_filter(640, 360),  # Low resolution
+                        "-vf", self.get_pad_to_16x9_filter(640, 360, crop),  # Low resolution
                         "-b:v", "500k", "-b:a", "96k",  # Low bitrate
                         "-deadline", "realtime", "-cpu-used", "16",  # Fastest possible encoding
                         "-threads", "4", 
@@ -1118,12 +1252,12 @@ class CloneHeroVideoDownloader:
                         startupinfo.wShowWindow = SW_HIDE
                         result = subprocess.run(final_cmd, 
                                              capture_output=True, 
-                                             text=True, 
+                                             text=True, encoding="utf-8", errors="replace", 
                                              timeout=300,  # 5 minute timeout
                                              startupinfo=startupinfo,
                                              creationflags=subprocess.CREATE_NO_WINDOW)
                     else:
-                        result = subprocess.run(final_cmd, capture_output=True, text=True, timeout=300)  # 5 minute timeout
+                        result = subprocess.run(final_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)  # 5 minute timeout
                     
                     if result.returncode == 0:
                         self.log("Last resort conversion successful!")
@@ -1136,7 +1270,8 @@ class CloneHeroVideoDownloader:
             if not conversion_success:
                 self.log(f"All conversion attempts failed for {song_name}")
                 return False
-            
+
+            os.replace(output_file, final_file)
             self.log(f"Successfully created video.webm for {song_name}")
             
             return True
@@ -1176,11 +1311,11 @@ class CloneHeroVideoDownloader:
                 startupinfo.wShowWindow = SW_HIDE
                 result = subprocess.run(cmd, 
                                       capture_output=True, 
-                                      text=True,
+                                      text=True, encoding="utf-8", errors="replace",
                                       startupinfo=startupinfo,
                                       creationflags=subprocess.CREATE_NO_WINDOW)
             else:
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
                 
             output = result.stdout.strip()
             
@@ -1553,11 +1688,11 @@ class CloneHeroVideoDownloader:
                     startupinfo.wShowWindow = SW_HIDE
                     result = subprocess.run(verify_cmd, 
                                          capture_output=True, 
-                                         text=True,
+                                         text=True, encoding="utf-8", errors="replace",
                                          startupinfo=startupinfo,
                                          creationflags=subprocess.CREATE_NO_WINDOW)
                 else:
-                    result = subprocess.run(verify_cmd, capture_output=True, text=True)
+                    result = subprocess.run(verify_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
                 if not result.stdout.strip():
                     self.log(f"Error: The custom URL could not be verified or is not a valid YouTube video: {video_url}")
                     if result.stderr.strip():
@@ -1580,7 +1715,6 @@ class CloneHeroVideoDownloader:
                 "--merge-output-format", "mp4",  # Target MP4 for initial download
                 "--no-playlist",
                 "--geo-bypass",
-                "--max-filesize", "100M",  # Limit file size to avoid huge downloads
                 *self.get_extractor_args(),
                 "-o", output_template,
                 video_url
@@ -1593,7 +1727,7 @@ class CloneHeroVideoDownloader:
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,  # merge so errors aren't lost in an unread pipe
-                    universal_newlines=True,
+                    universal_newlines=True, encoding="utf-8", errors="replace",
                     bufsize=1  # Line buffered
                 )
             else:
@@ -1601,7 +1735,7 @@ class CloneHeroVideoDownloader:
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,  # merge so errors aren't lost in an unread pipe
-                    universal_newlines=True,
+                    universal_newlines=True, encoding="utf-8", errors="replace",
                     bufsize=1  # Line buffered
                 )
             
@@ -1635,10 +1769,14 @@ class CloneHeroVideoDownloader:
                            if os.path.isfile(os.path.join(temp_dir, f)) and 
                            f.endswith(('.mp4', '.webm', '.mkv', '.avi'))]
             
+            # A leftover separate audio stream (e.g. "Title.f251.webm" from an
+            # unmerged download) has a video extension but no picture
+            video_files = [f for f in video_files if self.has_video_stream(os.path.join(temp_dir, f))]
+
             if not video_files:
-                self.log("No video files found after download")
+                self.log("No video files found after download (audio only?)")
                 continue
-            
+
             # Get the most recently modified file
             video_files.sort(key=lambda f: os.path.getmtime(os.path.join(temp_dir, f)), reverse=True)
             downloaded_file = os.path.join(temp_dir, video_files[0])
